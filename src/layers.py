@@ -48,6 +48,7 @@ class AttentionModule(torch.nn.Module):
         # 为图的每一个节点都计算一个 att_embedding表示
         # representation.shape = [filters_3, num_nodes] * [num_nodes, 1] = [filters_3, 1]  =>  [32, 1] 
         representation = torch.mm(torch.t(embedding), sigmoid_scores)
+        return representation
 
 class TenorNetworkModule(torch.nn.Module):
     """
