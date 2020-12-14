@@ -89,13 +89,29 @@ class TenorNetworkModule(torch.nn.Module):
         Making a forward propagation pass to create a similarity vector.
         :param embedding_1: Result of the 1st embedding after attention.
         :param embedding_2: Result of the 2nd embedding after attention.
-        即： 传入的是两个图的 att_embedding
+        即： 传入的是两个图的 att_embedding  shape: [filters_3, 1]  =>  [32, 1]
         :return scores: A similarity score vector.
         """
+
+        # calculate : scoring =  embedding_1 @ self.weight_matrix @ embedding_2
+        # shape change:  T([32, 1]) * [32, 32*16]  =>  [1, 32] * [32, 32*16]  =>  [1, 32*16]  =>  [1, 512]
         scoring = torch.mm(torch.t(embedding_1), self.weight_matrix.view(self.args.filters_3, -1))
+
+        # [1, 512]  =>  [32, 16]
         scoring = scoring.view(self.args.filters_3, self.args.tensor_neurons)
+        
+        # [16, 32] * [32, 1]  =>  [16, 1]
         scoring = torch.mm(torch.t(scoring), embedding_2)
+        
+        # calculate: block_scoring =  embedding_1_2  @  self.weight_matrix_block
+        # [64, 1]
         combined_representation = torch.cat((embedding_1, embedding_2))
+        
+        # [16, 64] * [64, 1]  =>  [16, 1] 
         block_scoring = torch.mm(self.weight_matrix_block, combined_representation)
+        
+        # scoring + block_scoring  
+        # 对应值相加
+        # [16, 1] + [16, 1] = [16, 1]
         scores = torch.nn.functional.relu(scoring + block_scoring + self.bias)
         return scores

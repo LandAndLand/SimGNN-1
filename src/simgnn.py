@@ -32,6 +32,7 @@ class SimGNN(torch.nn.Module):
         if self.args.histogram == True:
             self.feature_count = self.args.tensor_neurons + self.args.bins
         else:
+            # 16
             self.feature_count = self.args.tensor_neurons
 
     def setup_layers(self):
@@ -49,14 +50,20 @@ class SimGNN(torch.nn.Module):
         self.convolution_1 = GCNConv(self.number_labels, self.args.filters_1)
         self.convolution_2 = GCNConv(self.args.filters_1, self.args.filters_2)
         self.convolution_3 = GCNConv(self.args.filters_2, self.args.filters_3)
-        # 得到 [n, out_channels]?? 
+        # 得到 [n, out_channels]
+
         # att
         self.attention = AttentionModule(self.args)
-        # ???
+
+        # 用来计算 embedding_graph_1  和 embedding_graph_2 的合并向量
         self.tensor_network = TenorNetworkModule(self.args)
-        # bottle-neck-neurons
+
+        # bottle-neck-neurons , 16
+        # feature_count , 16
+        # [16, 16]
         self.fully_connected_first = torch.nn.Linear(self.feature_count,
                                                      self.args.bottle_neck_neurons)
+        # [16, 1]
         self.scoring_layer = torch.nn.Linear(self.args.bottle_neck_neurons, 1)
 
     def calculate_histogram(self, abstract_features_1, abstract_features_2):
@@ -106,7 +113,7 @@ class SimGNN(torch.nn.Module):
         features_1 = data["features_1"]
         features_2 = data["features_2"]
         
-        # 先使用图的邻接矩阵对特征矩阵进行GCN处理
+        # 先使用图的邻接矩阵对特征矩阵进行GCN处理, 得到图节点的嵌入表示
         # [num_nodes, embedding_size]  =>  [num_nodes, filters_3]
         abstract_features_1 = self.convolutional_pass(edge_index_1, features_1)
         abstract_features_2 = self.convolutional_pass(edge_index_2, features_2)
@@ -114,18 +121,25 @@ class SimGNN(torch.nn.Module):
         if self.args.histogram == True:
             hist = self.calculate_histogram(abstract_features_1,
                                             torch.t(abstract_features_2))
+
         # abstract_features_1 和 abstract_features_2是使用GCN对节点的嵌入表示后得到的矩阵
+        # 所以注意力机制层是得到 att_embedding
         # 尺寸为 [num_nodes, GCN_out_channels]  即:  [num_nodes, filters_3]
         # pooled_features_1 和 pooled_features_2  =>  [filters_3, 1]
         pooled_features_1 = self.attention(abstract_features_1)
         pooled_features_2 = self.attention(abstract_features_2)
+
+        # scores shape : [16, 1]
         scores = self.tensor_network(pooled_features_1, pooled_features_2)
+        # transpose: [1, 16]
         scores = torch.t(scores)
 
         if self.args.histogram == True:
             scores = torch.cat((scores, hist), dim=1).view(1, -1)
-
+        
+        # [1,16] @ [16, 16] = [1, 16]
         scores = torch.nn.functional.relu(self.fully_connected_first(scores))
+        # [1, 16] @ [16, 1] = [1, 1]
         score = torch.sigmoid(self.scoring_layer(scores))
         return score
 
@@ -168,6 +182,7 @@ class SimGNNTrainer(object):
         # 得到训练接所有节点特征的个数
         self.number_of_labels = len(self.global_labels)
         print(f'number_of_labels: {self.number_of_labels}')
+
     # 所以这里的数据预处理的形式直接是json文件;
     # 数据预处理的重要步骤就是:
     '''
@@ -256,12 +271,19 @@ class SimGNNTrainer(object):
             target = data["target"]
             # forward过程
             '''
-            经过transfer_to_torch处理的data是四个矩阵（2个边矩阵，2个特征矩阵，目前暂时不知道是啥）, 组成的
+            经过transfer_to_torch处理的data是四个矩阵（2个边矩阵，2个特征矩阵）组成的
             '''
             prediction = self.model(data)
             losses = losses + torch.nn.functional.mse_loss(data["target"], prediction)
         losses.backward(retain_graph=True)
         self.optimizer.step()
+
+        '''
+        losses.item()
+        The average of the batch losses will give you an estimate of the “epoch loss” during training. 
+        Since you are calculating the loss anyway, 
+        you could just sum it and calculate the mean after the epoch finishes.
+        '''
         loss = losses.item()
         return loss
 
@@ -283,6 +305,7 @@ class SimGNNTrainer(object):
         epochs = trange(self.args.epochs, leave=True, desc="Epoch")
         for epoch in epochs:
             # 把训练集随机分为若干个批次，每个批次有 batch_size个json文件
+            print(f'starting the {epoch+1} th epoch')
             batches = self.create_batches()
             self.loss_sum = 0
             main_index = 0
@@ -303,6 +326,7 @@ class SimGNNTrainer(object):
         self.ground_truth = []
         for graph_pair in tqdm(self.testing_graphs):
             data = process_pair(graph_pair)
+            # 计算norm_ged
             self.ground_truth.append(calculate_normalized_ged(data))
             data = self.transfer_to_torch(data)
             target = data["target"]
