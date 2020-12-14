@@ -3,6 +3,7 @@
 import glob
 import torch
 import random
+import json
 import numpy as np
 from tqdm import tqdm, trange
 from torch_geometric.nn import GCNConv
@@ -38,11 +39,22 @@ class SimGNN(torch.nn.Module):
         Creating the layers.
         """
         self.calculate_bottleneck_features()
+        # 三层GCN
+        '''
+        GCN init: def __init__(self, in_channels, out_channels)
+        def forward(self, x, edge_index):
+            x has shape [N, in_channels]
+            edge_index has shape [2, E]
+        '''
         self.convolution_1 = GCNConv(self.number_labels, self.args.filters_1)
         self.convolution_2 = GCNConv(self.args.filters_1, self.args.filters_2)
         self.convolution_3 = GCNConv(self.args.filters_2, self.args.filters_3)
+        # 得到 [n, out_channels]?? 
+        # att
         self.attention = AttentionModule(self.args)
+        # ???
         self.tensor_network = TenorNetworkModule(self.args)
+        # bottle-neck-neurons
         self.fully_connected_first = torch.nn.Linear(self.feature_count,
                                                      self.args.bottle_neck_neurons)
         self.scoring_layer = torch.nn.Linear(self.args.bottle_neck_neurons, 1)
@@ -66,7 +78,7 @@ class SimGNN(torch.nn.Module):
         Making convolutional pass.
         :param edge_index: Edge indices.
         :param features: Feature matrix.
-        :return features: Absstract feature matrix.
+        :return features: Abstract feature matrix.
         """
         features = self.convolution_1(features, edge_index)
         features = torch.nn.functional.relu(features)
@@ -93,14 +105,18 @@ class SimGNN(torch.nn.Module):
         edge_index_2 = data["edge_index_2"]
         features_1 = data["features_1"]
         features_2 = data["features_2"]
-
+        
+        # 先使用图的邻接矩阵对特征矩阵进行GCN处理
+        # [num_nodes, embedding_size]  =>  [num_nodes, filters_3]
         abstract_features_1 = self.convolutional_pass(edge_index_1, features_1)
         abstract_features_2 = self.convolutional_pass(edge_index_2, features_2)
 
         if self.args.histogram == True:
             hist = self.calculate_histogram(abstract_features_1,
                                             torch.t(abstract_features_2))
-
+        # abstract_features_1 和 abstract_features_2是使用GCN对节点的嵌入表示后得到的矩阵
+        # 尺寸为 [num_nodes, GCN_out_channels]  即:  [num_nodes, filters_3]
+        # pooled_features_1 和 pooled_features_2  =>  [filters_3, 1]
         pooled_features_1 = self.attention(abstract_features_1)
         pooled_features_2 = self.attention(abstract_features_2)
         scores = self.tensor_network(pooled_features_1, pooled_features_2)
@@ -123,6 +139,7 @@ class SimGNNTrainer(object):
         """
         self.args = args
         self.initial_label_enumeration()
+        # 初始化模型的layer
         self.setup_model()
 
     def setup_model(self):
@@ -140,14 +157,34 @@ class SimGNNTrainer(object):
         self.testing_graphs = glob.glob(self.args.testing_graphs + "*.json")
         graph_pairs = self.training_graphs + self.testing_graphs
         self.global_labels = set()
+        # 预处理所有的graph
         for graph_pair in tqdm(graph_pairs):
-            data = process_pair(graph_pair)
+            # data = process_pair(graph_pair)
+            data = json.load(open(graph_pair))
             self.global_labels = self.global_labels.union(set(data["labels_1"]))
             self.global_labels = self.global_labels.union(set(data["labels_2"]))
         self.global_labels = list(self.global_labels)
         self.global_labels = {val:index  for index, val in enumerate(self.global_labels)}
+        # 得到训练接所有节点特征的个数
         self.number_of_labels = len(self.global_labels)
+        print(f'number_of_labels: {self.number_of_labels}')
+    # 所以这里的数据预处理的形式直接是json文件;
+    # 数据预处理的重要步骤就是:
+    '''
+    训练接和测试集都是由json文件组成的；
+    划分批次也直接是在json文件的粒度上进行划分的；
+    所以这里的数据预处理的形式直接是json文件;
+    
 
+    数据预处理的重要步骤就是:
+    1、如何批量生程PDG
+    2、 如何把PDG转化为json文件(json文件的组成内容是什么形式)
+    json文件的label1 、 label2、 graph_1 、 graph_2 都是由什么组成的呢？
+
+    目前猜测:
+    labels_1 和 labels_2 应该是图节点的取值；
+    graph_1 和 graph_2 是由图的所有的边组成的, 边的组成是由 开始节点的index -> 目标节点的index ；如，边[0, 1]表示index为0的节点指向index为1的节点
+    '''
     def create_batches(self):
         """
         Creating batches from the training graph list.
@@ -155,36 +192,42 @@ class SimGNNTrainer(object):
         """
         random.shuffle(self.training_graphs)
         batches = []
-        for graph in range(0, len(self.training_graphs), self.args.batch_size):
-            batches.append(self.training_graphs[graph:graph+self.args.batch_size])
+        for index in range(0, len(self.training_graphs), self.args.batch_size):
+            batches.append(self.training_graphs[index: index+self.args.batch_size])
         return batches
 
     def transfer_to_torch(self, data):
         """
         Transferring the data to torch and creating a hash table.
         Including the indices, features and target.
+
         :param data: Data dictionary.
         :return new_data: Dictionary of Torch Tensors.
         """
         new_data = dict()
+        # 转换图为无向图
+        # 边记为 e ， 则edges_1的尺寸为 2e * 2
         edges_1 = data["graph_1"] + [[y, x] for x, y in data["graph_1"]]
-
         edges_2 = data["graph_2"] + [[y, x] for x, y in data["graph_2"]]
 
+        # # edges_1_T的尺寸为 2* 2e; 上面的行是出发顶点；下面的行是目标顶点
         edges_1 = torch.from_numpy(np.array(edges_1, dtype=np.int64).T).type(torch.long)
         edges_2 = torch.from_numpy(np.array(edges_2, dtype=np.int64).T).type(torch.long)
 
         features_1, features_2 = [], []
 
+        # features_1 的尺寸是 len(data["labels_1"]) * len(self.global_labels.values())
+        # 即： [num_nodes, all_num_features]
         for n in data["labels_1"]:
             features_1.append([1.0 if self.global_labels[n] == i else 0.0 for i in self.global_labels.values()])
 
         for n in data["labels_2"]:
             features_2.append([1.0 if self.global_labels[n] == i else 0.0 for i in self.global_labels.values()])
-
+        
         features_1 = torch.FloatTensor(np.array(features_1))
         features_2 = torch.FloatTensor(np.array(features_2))
-
+        
+        # edge_index_1和edge_index_2 ： 无向图表示形式的所有的边  => [2, 2e]
         new_data["edge_index_1"] = edges_1
         new_data["edge_index_2"] = edges_2
 
@@ -192,22 +235,29 @@ class SimGNNTrainer(object):
         new_data["features_2"] = features_2
 
         norm_ged = data["ged"]/(0.5*(len(data["labels_1"])+len(data["labels_2"])))
-
+        
+        # 转换target为一个具体的[0, 1]之间的数字
         new_data["target"] = torch.from_numpy(np.exp(-norm_ged).reshape(1, 1)).view(-1).float()
         return new_data
 
     def process_batch(self, batch):
         """
         Forward pass with a batch of data.
+
         :param batch: Batch of graph pair locations.
         :return loss: Loss on the batch.
         """
         self.optimizer.zero_grad()
         losses = 0
         for graph_pair in batch:
+            # 载入json文件的数据
             data = process_pair(graph_pair)
             data = self.transfer_to_torch(data)
             target = data["target"]
+            # forward过程
+            '''
+            经过transfer_to_torch处理的data是四个矩阵（2个边矩阵，2个特征矩阵，目前暂时不知道是啥）, 组成的
+            '''
             prediction = self.model(data)
             losses = losses + torch.nn.functional.mse_loss(data["target"], prediction)
         losses.backward(retain_graph=True)
@@ -224,10 +274,15 @@ class SimGNNTrainer(object):
         self.optimizer = torch.optim.Adam(self.model.parameters(),
                                           lr=self.args.learning_rate,
                                           weight_decay=self.args.weight_decay)
-
+        '''
+        model.train() tells your model that you are training the model. So effectively layers like dropout, batchnorm etc;
+        You can call either model.eval() or model.train(mode=False) to tell that you are testing；
+        self.model.train()其实就是告诉model进入train模式
+        '''
         self.model.train()
         epochs = trange(self.args.epochs, leave=True, desc="Epoch")
         for epoch in epochs:
+            # 把训练集随机分为若干个批次，每个批次有 batch_size个json文件
             batches = self.create_batches()
             self.loss_sum = 0
             main_index = 0
